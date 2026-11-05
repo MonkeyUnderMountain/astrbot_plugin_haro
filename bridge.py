@@ -64,7 +64,7 @@ class HaroBridge:
                 if (challenge.get("type") != "challenge" or not re.fullmatch(r"[a-f0-9]{64}", nonce)
                         or not hmac.compare_digest(challenge.get("proof", ""), proof("server"))):
                     raise RuntimeError("Haro 服务端认证失败")
-                await self._write({"type": "hello", "proof": proof("client")})
+                await self._write({"type": "hello", "proof": proof("client"), "capabilities": ["approval-file-v1"]})
                 packet = json.loads(await asyncio.wait_for(reader.readline(), 5))
                 if packet.get("type") != "ready":
                     raise RuntimeError("Haro 握手未完成")

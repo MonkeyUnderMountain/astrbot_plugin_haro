@@ -1,7 +1,9 @@
 """AstrBot 处理消息呈现；身份、记忆和原生执行由独立 Haro Host 持有。"""
 import asyncio
 import shutil
+import tempfile
 import uuid
+from contextlib import ExitStack
 from datetime import datetime
 from pathlib import Path
 
@@ -124,7 +126,7 @@ def message_context(event):
 
 
 
-@register("haro", "Haro contributors", "Haro 原生助手桥接", "0.1.3")
+@register("haro", "Haro contributors", "Haro 原生助手桥接", "0.1.4")
 class HaroPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -211,7 +213,7 @@ class HaroPlugin(Star):
             return
         event.stop_event()
         interaction = event.get_button_interaction()
-        if interaction is not None:
+        if interaction is not None and isinstance(interaction.data, dict):
             await self.bridge.send({"type": "approval", **source,
                                     "approvalId": interaction.data.get("id"),
                                     "decision": interaction.data.get("decision")})
@@ -222,37 +224,47 @@ class HaroPlugin(Star):
 
     # ========== Haro 出站与插件收尾 ==========
 
+    def _approval_parts(self, item, temporary):
+        # 文件名只含随机值。原生材料不进按钮payload或默认日志，发送后清理本机副本。
+        folder = Path(temporary.enter_context(tempfile.TemporaryDirectory(prefix=".haro-approval-", dir=self.bridge.connection_file.parent)))
+        file = folder / "approval-details.txt"
+        file.write_text(item["details"], encoding="utf-8", newline="")
+        parts = [Comp.Plain(item["summary"]), Comp.File(file=str(file), name="Haro-审批完整详情.txt")]
+        if item.get("allowOnce", True):
+            choices = [("accept", "允许本次"), ("decline", "拒绝")]
+            parts.append(Comp.ActionRow(
+                buttons=[Comp.Button(id="haro:approval", label=label,
+                                     action=Comp.Button.CallbackAction(data={"id": item["id"], "decision": value}))
+                         for value, label in choices],
+                action_timeout=300,
+                fallback_text="；".join(f"/approve {item['id']} {value}" for value, _ in choices),
+            ))
+        return parts
+
     async def _deliver(self, packet):
         if "targetId" in packet:
             return await self._deliver_target(packet)
         origin = packet["origin"]
         if origin not in self._origins:
             return False
-        parts = []
-        for item in packet["content"]:
-            if item["type"] == "text":
-                parts.append(Comp.Plain(item["text"]))
-            elif item["type"] == "file":
-                parts.append(Comp.File(file=item["path"], name=item["name"]))
-            elif item["type"] == "image":
-                parts.append(Comp.Image.fromFileSystem(item["path"]))
-            elif item["type"] == "approval":
-                lines = ["Haro 原生工具审批"]
-                for key, label in (("command", "命令"), ("cwd", "目录"), ("reason", "原因"), ("details", "详情")):
-                    if item.get(key):
-                        lines.append(f"{label}：{item[key]}")
-                parts.append(Comp.Plain("\n".join(lines)[:3500]))
-                choices = [("decline", "拒绝")]
-                if item.get("allowOnce", True):
-                    choices.insert(0, ("accept", "允许这一次"))
-                parts.append(Comp.ActionRow(
-                    buttons=[Comp.Button(id="haro:approval", label=label,
-                                         action=Comp.Button.CallbackAction(data={"id": item["id"], "decision": value}))
-                             for value, label in choices],
-                    action_timeout=300,
-                    fallback_text="；".join(f"/approve {item['id']} {value}" for value, _ in choices),
-                ))
-        return await self.context.send_message(origin, MessageChain(parts)) is True
+        with ExitStack() as temporary:
+            parts = []
+            for item in packet["content"]:
+                if item["type"] == "text":
+                    parts.append(Comp.Plain(item["text"]))
+                elif item["type"] == "file":
+                    parts.append(Comp.File(file=item["path"], name=item["name"]))
+                elif item["type"] == "image":
+                    parts.append(Comp.Image.fromFileSystem(item["path"]))
+                elif item["type"] == "approval":
+                    if item.get("format") != "file-v1" or not all(isinstance(item.get(key), str) for key in ("summary", "details")):
+                        return {"kind": "failed", "code": "APPROVAL_HOST_UPDATE_REQUIRED"}
+                    platform = self.context.get_platform_inst(origin.split(":", 1)[0])
+                    if platform is None or platform.meta().name not in ("telegram", "aiocqhttp"):
+                        return {"kind": "failed", "code": "APPROVAL_CHANNEL_UNSUPPORTED"}
+                    parts.extend(self._approval_parts(item, temporary))
+            # 超时/取消也会退出ExitStack；不把发送任务留在后台读已删除文件。
+            return await self.context.send_message(origin, MessageChain(parts)) is True
 
     def _target_available(self, target):
         owner = target.get("ownerId", "")
