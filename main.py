@@ -2,6 +2,7 @@
 import asyncio
 import shutil
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 from astrbot.api import AstrBotConfig, logger
@@ -12,7 +13,118 @@ import astrbot.api.message_components as Comp
 from .bridge import HaroBridge
 
 
-@register("haro", "Haro contributors", "Haro 原生助手桥接", "0.1.2")
+# 历史材料只提取白名单字段；不取文件、不联网补查，也不参与主人认证或回信路由。
+def _message_id(value):
+    if type(value) not in (str, int):
+        return None
+    value = str(value)
+    return value if value and len(value) <= 256 and "\0" not in value else None
+
+
+def _original_time(value):
+    if isinstance(value, datetime) and value.tzinfo is not None and value.timestamp() > 0:
+        return value.isoformat()
+    return None
+
+
+def _reference_text(result, key, value, limit=4000):
+    if isinstance(value, str):
+        result[key] = value[:limit]
+        result["truncated"] = result["truncated"] or len(value) > limit
+
+
+def _reference(source, event, normalized=False, external=False):
+    sender = getattr(source, "from_user", None)
+    if sender is None:
+        sender = getattr(getattr(source, "origin", None), "sender_user", None)
+    sender_id = _message_id(getattr(sender, "id", None) if sender else getattr(source, "sender_id", None))
+    if normalized and sender_id == "0":
+        sender_id = None  # 通用Reply用0表示未提供发送者。
+    try:
+        bot_id = _message_id(getattr(getattr(event, "client", None), "id", None))
+    except RuntimeError:
+        bot_id = None  # Bot未初始化时不调用get_me，也不以昵称推断是当前机器人。
+    role = "unknown"
+    if sender_id and sender_id == str(event.get_sender_id()):
+        role = "owner"
+    elif sender_id and bot_id:
+        role = "assistant" if sender_id == bot_id else "other"
+    result = {"sender": role, "contentType": "unknown", "availability": "unavailable", "truncated": False}
+    origin = getattr(source, "origin", None) if external else None
+    for key, value in (("messageId", getattr(source, "id" if normalized else "message_id", None) or getattr(origin, "message_id", None)),
+                       ("conversationId", getattr(getattr(source, "chat", None) or getattr(origin, "chat", None), "id", None)),
+                       ("senderId", sender_id)):
+        if (value := _message_id(value)) is not None:
+            result[key] = value
+    # 通用Reply.time可能是转换时的当前时间，不能拿来填历史时间。
+    date = None if normalized else getattr(source, "date", None) or getattr(getattr(source, "origin", None), "date", None)
+    if (date := _original_time(date)) is not None:
+        result["timestamp"] = date
+    body = getattr(source, "message_str", None) if normalized else getattr(source, "text", None)
+    body = body or getattr(source, "text" if normalized else "caption", None)
+    if isinstance(body, str) and body:
+        result["contentType"] = "text"
+        _reference_text(result, "text", body)
+        result["availability"] = "available"
+    chain = (getattr(source, "chain", None) or []) if normalized else []
+    if getattr(source, "photo", None) or any(isinstance(item, Comp.Image) for item in chain):
+        result["contentType"] = "image"
+    media = next((getattr(source, key, None) for key in ("document", "video", "audio", "voice", "animation", "video_note", "sticker")
+                  if getattr(source, key, None) is not None), None)
+    if media is not None or any(isinstance(item, Comp.File) for item in chain):
+        result["contentType"] = "file"
+    if media is not None:
+        _reference_text(result, "description", getattr(media, "file_name", None), 1000)
+    elif normalized:
+        file = next((item for item in chain if isinstance(item, Comp.File)), None)
+        _reference_text(result, "description", getattr(file, "name", None), 1000)
+    if result["contentType"] in ("image", "file"):
+        result.update(availability="partial", reason="ATTACHMENT_NOT_FETCHED")
+    if normalized:
+        result.update(availability="partial" if result.get("text") or result["contentType"] != "unknown" else "unavailable",
+                      reason="NORMALIZED_REPLY_ONLY")
+    elif external:
+        result.update(availability="partial" if result.get("text") or result["contentType"] != "unknown" else "unavailable",
+                      reason="EXTERNAL_REPLY")
+    elif result["availability"] == "unavailable":
+        result["reason"] = "CONTENT_NOT_PROVIDED"
+    return result
+
+
+def message_context(event):
+    message = event.message_obj
+    raw = getattr(getattr(message, "raw_message", None), "message", None) if event.get_platform_name() == "telegram" else None
+    result = {}
+    for key, value in (("messageId", getattr(raw, "message_id", None) if raw else getattr(message, "message_id", None)),
+                       ("conversationId", getattr(getattr(raw, "chat", None), "id", None) if raw else getattr(message, "session_id", None))):
+        if (value := _message_id(value)) is not None:
+            result[key] = value
+    if raw is not None and (date := _original_time(getattr(raw, "date", None))) is not None:
+        result["timestamp"] = date
+    reference = getattr(raw, "reply_to_message", None)
+    external = getattr(raw, "external_reply", None)
+    if reference is not None or external is not None:
+        result["replyTo"] = _reference(reference if reference is not None else external, event, external=reference is None)
+    else:
+        reply_class = getattr(Comp, "Reply", None)
+        reply = next((item for item in event.get_messages() if reply_class and isinstance(item, reply_class)), None)
+        if reply is not None:
+            result["replyTo"] = _reference(reply, event, normalized=True)
+    quote = getattr(raw, "quote", None)
+    if quote is not None and isinstance(getattr(quote, "text", None), str):
+        result["quote"] = {"truncated": False}
+        _reference_text(result["quote"], "text", quote.text)
+        if type(getattr(quote, "position", None)) is int and 0 <= quote.position <= 9007199254740991:
+            result["quote"]["position"] = quote.position  # 原生UTF-16码元位置，不重新切片原文。
+        if type(getattr(quote, "is_manual", None)) is bool:
+            result["quote"]["isManual"] = quote.is_manual
+    return result
+
+
+
+
+
+@register("haro", "Haro contributors", "Haro 原生助手桥接", "0.1.3")
 class HaroPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -84,8 +196,10 @@ class HaroPlugin(Star):
             if not self.bridge.connected or self.bridge.generation != generation:
                 raise RuntimeError("Haro 连接已更换，本次任务未接收")
             self._origins.add(source["origin"])
+            context = message_context(event)
             await self.bridge.send({"type": "message", **source, "text": event.message_obj.message_str,
-                                    "attachments": attachments}, generation=generation)
+                                    "attachments": attachments,
+                                    **({"messageContext": context} if context else {})}, generation=generation)
         except Exception as error:
             logger.error(f"Haro 入站失败：{type(error).__name__}")
             await event.send(event.plain_result("本次提交未确认，请检查 Haro 状态和插件日志，避免直接重复提交。"))
