@@ -13,6 +13,7 @@ import astrbot.api.message_components as Comp
 
 from .bridge import HaroBridge
 from .memes import MemeIntegration
+from .targets import inspect_target, deliver_target
 
 
 # 历史材料只提取白名单字段；不取文件、不联网补查，也不参与主人认证或回信路由。
@@ -131,7 +132,7 @@ def message_context(event):
 
 
 
-@register("haro", "Haro contributors", "Haro 原生助手桥接", "0.1.5")
+@register("haro", "Haro contributors", "Haro 原生助手桥接", "0.1.6")
 class HaroPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -170,11 +171,13 @@ class HaroPlugin(Star):
         return (self._owner(source) and source["platform"] == "telegram"
                 and f"telegram:{source['sender']}" == getattr(self.bridge, "approver_owner_id", None))
 
-    async def _send(self, *, origin=None, chain=None, event=None, client=None, payload=None, guard=lambda: True):
+    async def _send(self, *, origin=None, chain=None, event=None, client=None, payload=None, operation=None, guard=lambda: True):
         """唯一平台提交入口。调用方提供已核验路由；提交前重查，超时不重发。"""
         if not guard():
             raise RuntimeError("Haro 发送来源已失效")
-        if event is not None:
+        if operation is not None:
+            pending = operation(guard)
+        elif event is not None:
             pending = event.send(chain)
         elif client is not None:
             pending = client.send_message(**payload)
@@ -309,43 +312,17 @@ class HaroPlugin(Star):
             self.bridge.connected and self.bridge.generation == generation and origin in self._origins) is True
 
     def _target_available(self, target):
-        owner = target.get("ownerId", "")
-        instance = target.get("platformId", "")
-        if (owner not in self.bridge.owners or not owner.startswith("telegram:")
-                or not owner[9:].isdigit() or not instance or ":" in instance
-                or target.get("origin") != f"{instance}:FriendMessage:{owner[9:]}"):
-            return False
-        platform = self.context.get_platform_inst(instance)
-        return platform is not None and platform.meta().name == "telegram"
+        return inspect_target(self.context, self.bridge.owners, target)[0] is not None
 
     def _inspect_targets(self, targets):
-        return [{"id": target["id"], "available": self._target_available(target)} for target in targets]
+        result = []
+        for target in targets:
+            platform, reason = inspect_target(self.context, self.bridge.owners, target)
+            result.append({"id": target["id"], "available": platform is not None, "reason": reason})
+        return result
 
     async def _deliver_target(self, packet):
-        target = self.bridge.targets.get(packet["targetId"])
-        content = packet.get("content", [])
-        if (not target or not self._target_available(target) or packet.get("origin") != target["origin"]
-                or len(content) != 1 or content[0].get("type") not in ("text", "file", "image")):
-            return {"kind": "failed", "code": "TARGET_UNAVAILABLE"}
-        item = content[0]
-        if item["type"] == "text":
-            if not isinstance(item.get("text"), str) or not 0 < len(item["text"]) <= 1200:
-                return {"kind": "failed", "code": "TARGET_UNAVAILABLE"}
-            parts = [Comp.Plain(item["text"])]
-        elif item["type"] == "file":
-            parts = [Comp.File(file=item["path"], name=item["name"])]
-        else:
-            parts = [Comp.Image.fromFileSystem(item["path"])]
-        generation = self.bridge.generation
-        try:
-            sent = await self._send(origin=target["origin"], chain=MessageChain(parts), guard=lambda:
-                self.bridge.connected and self.bridge.generation == generation and self._target_available(target))
-            return {"kind": "ok"} if sent is True else {"kind": "failed", "code": "PLATFORM_REJECTED"}
-        except Exception as error:
-            # Telegram 明确拒绝与结果不明分开；不绕过 AstrBot 读取 Bot Token。
-            from telegram.error import BadRequest, Forbidden, InvalidToken
-            rejected = isinstance(error, (BadRequest, Forbidden, InvalidToken))
-            return {"kind": "failed" if rejected else "unknown", "code": "PLATFORM_REJECTED" if rejected else "DELIVERY_UNCONFIRMED"}
+        return await deliver_target(self, packet)
 
     async def terminate(self):
         if self.bridge:

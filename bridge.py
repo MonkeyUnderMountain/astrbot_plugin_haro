@@ -17,6 +17,8 @@ class HaroBridge:
         self.inspect_targets = inspect_targets
         self.cancel_meme = cancel_meme
         self._meme_tasks = {}
+        self._send_tasks = {}
+        self._target_active = set()
         self.owners = set()
         self.approver_owner_id = None
         self.targets = {}
@@ -93,6 +95,7 @@ class HaroBridge:
                 self.connected = False
                 self.approver_owner_id = None
                 self.generation += 1
+                await self._revoke_targets()
                 await self._cancel_memes()
                 self.targets.clear()
                 self.disconnected()
@@ -112,8 +115,22 @@ class HaroBridge:
     # ========== 出站回执与客户端收尾 ==========
 
     async def _read(self, reader):
-        while line := await reader.readline():
+        loop = asyncio.get_running_loop()
+        next_status = loop.time() + 5
+        while True:
+            if loop.time() >= next_status:
+                await self.send({"type": "target_status", "targets": self.inspect_targets(self.targets.values())})
+                next_status = loop.time() + 5
+            try:
+                line = await asyncio.wait_for(reader.readline(), max(0.01, next_status - loop.time()))
+            except asyncio.TimeoutError:
+                continue
+            if not line:
+                break
             packet = json.loads(line)
+            if packet.get("type") == "send_cancel":
+                self._target_active.discard(packet.get("id"))
+                continue
             if packet.get("type") == "meme_cancel":
                 key = packet.get("routeKey")
                 self.cancel_meme(key)
@@ -122,6 +139,24 @@ class HaroBridge:
                     task.cancel()
                 continue
             if packet.get("type") != "send":
+                continue
+            # 所有平台提交都交受管任务；普通控制发送也不能挡住取消帧或EOF。
+            if packet.get("format") != "meme-manager-v1":
+                key = packet["id"]
+                if key in self._send_tasks or len(self._send_tasks) >= 40:
+                    await self.send({"type": "receipt", "id": key, "kind": "failed", "code": "TARGET_UNAVAILABLE"})
+                    continue
+                if "targetId" in packet:
+                    self._target_active.add(key)
+                task = asyncio.create_task(self._receipt(packet, self.generation))
+                self._send_tasks[key] = task
+                def send_finished(done, key=key):
+                    if self._send_tasks.get(key) is done:
+                        del self._send_tasks[key]
+                    self._target_active.discard(key)
+                    if not done.cancelled():
+                        done.exception()
+                task.add_done_callback(send_finished)
                 continue
             if packet.get("format") == "meme-manager-v1":
                 key = packet.get("routeKey")
@@ -136,12 +171,13 @@ class HaroBridge:
                     if not done.cancelled():
                         done.exception()  # 断线后的回执不可重放，取出异常避免悬空任务。
                 task.add_done_callback(finished)
-            else:
-                await self._receipt(packet, self.generation)
 
     async def _receipt(self, packet, generation):
         try:
-            result = await asyncio.wait_for(self.deliver(packet), 12)
+            local = dict(packet)
+            if "targetId" in local:
+                local["_active"] = lambda: self.connected and generation == self.generation and packet["id"] in self._target_active
+            result = await asyncio.wait_for(self.deliver(local), 12)
             if isinstance(result, bool):
                 result = {"kind": "ok" if result else "unknown"}
         except asyncio.CancelledError:
@@ -151,7 +187,14 @@ class HaroBridge:
         except Exception as error:
             self.log(f"Haro 渠道发送结果不明：{type(error).__name__}")
             result = {"kind": "unknown"}
-        await self.send({"type": "receipt", "id": packet["id"], **result}, generation=generation)
+        if self.connected and generation == self.generation:
+            await self.send({"type": "receipt", "id": packet["id"], **result}, generation=generation)
+
+    async def _revoke_targets(self):
+        # 不取消已提交的HTTP以伪造失败；只撤销下一步资格，已提交回执仍可收尾。
+        self._target_active.clear()
+        await asyncio.gather(*list(self._send_tasks.values()), return_exceptions=True)
+        self._send_tasks.clear()
 
     async def _cancel_memes(self):
         tasks = list(self._meme_tasks.values())
@@ -166,5 +209,6 @@ class HaroBridge:
             await asyncio.gather(self._task, return_exceptions=True)
             self._task = None
         self.connected = False
+        await self._revoke_targets()
         self.owners.clear()
         self.targets.clear()

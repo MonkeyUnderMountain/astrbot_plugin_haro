@@ -10,13 +10,14 @@
 
 计划发布地址：[MonkeyUnderMountain/astrbot_plugin_haro](https://github.com/MonkeyUnderMountain/astrbot_plugin_haro)。当前已完成本地仓库准备，尚未创建或推送这个远端；以下链接安装／在线更新需要先完成发布。
 
-发布后，在 AstrBot 的插件页选择“从链接安装”，填入上述仓库地址。也可以手动把下面七个文件放到 `data/plugins/astrbot_plugin_haro/`，然后重载插件：
+发布后，在 AstrBot 的插件页选择“从链接安装”，填入上述仓库地址。也可以手动把下面八个文件放到 `data/plugins/astrbot_plugin_haro/`，然后重载插件：
 
 | 文件 | 职责 |
 |---|---|
 | [main.py](main.py) | 注册事件、核验来源、提取历史引用、复制当前附件、呈现回复和固定目标发送 |
 | [bridge.py](bridge.py) | 本机 TCP JSONL、双向认证、回执和自动重连 |
 | [memes.py](memes.py) | Meme Manager 5.3.5隔离选图、固定来源、单图与清理 |
+| [targets.py](targets.py) | Telegram／QQ官方／微信本人主动目标、平台能力检查和单次QQ请求 |
 | [metadata.yaml](metadata.yaml) | 名称、版本与更新仓库地址 |
 | [_conf_schema.json](_conf_schema.json) | 插件配置表单 |
 | README.md | 本说明 |
@@ -84,7 +85,7 @@ v0.1.2 起可以先安装插件再配置：未填或路径不是绝对路径时�
 
 ## 更新
 
-发布新版本后，在 AstrBot 的“已安装”页面找到 Haro，点击“更新”获取代码；“重载”只重新加载已有代码，不下载版本。手动安装的副本也可重新覆盖上述七个文件后重载。版本变化先查看[更新日志](CHANGELOG.md)；下面保留关键升级说明。
+发布新版本后，在 AstrBot 的“已安装”页面找到 Haro，点击“更新”获取代码；“重载”只重新加载已有代码，不下载版本。手动安装的副本也可重新覆盖上述八个文件后重载。版本变化先查看[更新日志](CHANGELOG.md)；下面保留关键升级说明。
 
 插件与 Host 分别更新。更新 Haro JavaScript、外部配置或凭据文件后，应正常关闭并重新启动 Host；插件会重连。旧版插件若曾负责启动 Node，应先正常卸载并确认旧子进程已退出，再启动独立 Host 和配置本版插件，避免两份实例使用同一份记忆。
 
@@ -126,7 +127,7 @@ Haro专属AstrBot配置档的完整模板、覆盖项、生成器及应用步骤
 node scripts/sync-astrbot-plugin.mjs
 ```
 
-命令只同步七文件：main.py、bridge.py、memes.py、metadata.yaml、_conf_schema.json、README.md、CHANGELOG.md，到 `.release/astrbot_plugin_haro/`；该目录作为小仓库的工作目录，Git 历史单独维护。同步不创建远端、不提交或推送。每次发布同时更新metadata、注册版本和CHANGELOG中的版本记录，说明变更、兼容要求与已知限制；同步脚本要求日志最新版本与metadata一致。完成主仓库回归与Python检查后，再检查发布副本并按授权提交、推送。
+命令只同步八文件：main.py、bridge.py、memes.py、targets.py、metadata.yaml、_conf_schema.json、README.md、CHANGELOG.md，到`.release/astrbot_plugin_haro/`；该目录作为小仓库的工作目录，Git历史单独维护。同步不创建远端、不提交或推送。每次发布同时更新metadata、注册版本和CHANGELOG中的版本记录，说明变更、兼容要求与已知限制；同步脚本要求日志最新版本与metadata一致。完成主仓库回归与Python检查后，再检查发布副本并按授权提交、推送。
 
 目前尚未指定对外许可证，由主人在公开分发前确定。
 
@@ -143,3 +144,15 @@ node scripts/sync-astrbot-plugin.mjs
 Host所有业务出站共用MessageSender，Python的离线、失败、话题、SDK、Context和Meme图片提交全部走HaroPlugin._send。控制和审批不等待普通FIFO。审批只允许配置owners中唯一数值Telegram主人号，零个或多个即关闭；QQ、终端及其他号不能审批，不跨来源转发。按钮和文字审批都检查，旧Host缺审批人字段时也拒绝。
 
 连接文件版本和插件表单不变，schema6／备份v7不变；Host与插件需配套更新，本轮未覆盖或重载日用实例。七文件本地发布包另同步，不代表远端发布或真实平台验收。
+
+
+
+
+
+## 2026-11-07 主动目标与定时（v0.1.6未发布）
+
+新增targets.py，主动目标支持本人Telegram、QQ官方、个人微信；仍由人工填写owners及targets，模型只选择已绑定ID。QQ只执行经兼容检查的一次HTTP请求，响应ID有效才记平台确认；媒体首版≤10MiB。微信需要AstrBot已有真实入站上下文，发送不承诺固定有效期或配额。
+
+主动目标有按send包ID的取消门禁，读取循环不会被上传阻塞；Host停止／断线后不能继续下一步消息提交，SDK鉴权等待后也重查。已经提交HTTP的回执保留真实结果。定时Telegram任务仍只能由唯一主人在原来源审批，QQ／微信不能审批。
+
+配套Host提供schedule_create/list/update/cancel，到点进入原有单队列；Host须运行，离线错过不补跑，恢复备份后计划暂停。存储现为schema7／haro-memory-v8，旧库须离线预览、显式转换。本轮源码与本地导出不代表已更新正式实例或验证真实平台。
