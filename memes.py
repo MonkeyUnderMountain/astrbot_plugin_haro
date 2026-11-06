@@ -24,8 +24,8 @@ class MemeSource:
 
 class _SendContext:
     """兼容接口使用独立实例副本；只将图片送往捕获的同一来源，不改共享插件状态。"""
-    def __init__(self, original, guard, origin):
-        self.original, self.guard, self.origin = original, guard, origin
+    def __init__(self, owner, original, guard, origin):
+        self.owner, self.original, self.guard, self.origin = owner, original, guard, origin
 
     def __getattr__(self, name):
         return getattr(self.original, name)
@@ -33,7 +33,9 @@ class _SendContext:
     async def send_message(self, origin, chain, *args, **kwargs):
         if origin != self.origin or not self.guard():
             raise RuntimeError("MEME_ROUTE_UNAVAILABLE")
-        result = await self.original.send_message(origin, chain, *args, **kwargs)
+        if args or kwargs:
+            raise RuntimeError("MEME_SEND_ARGUMENTS_UNSUPPORTED")
+        result = await self.owner._send(origin=origin, chain=chain, guard=self.guard)
         if result is not True:
             raise RuntimeError("MEME_RECEIPT_UNKNOWN")
         return result
@@ -114,7 +116,7 @@ class MemeIntegration:
                 return self._ready(route, source) and self._manager() is manager
             except (ValueError, AttributeError):
                 return False
-        adapter.context = _SendContext(manager.context, guard, route["origin"])
+        adapter.context = _SendContext(self.owner, manager.context, guard, route["origin"])
         # history由原实例懒初始化；不能只留在一次调用的浅副本上。
         adapter._confirm_meme_delivery = manager._confirm_meme_delivery
         try:

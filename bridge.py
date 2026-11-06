@@ -18,6 +18,7 @@ class HaroBridge:
         self.cancel_meme = cancel_meme
         self._meme_tasks = {}
         self.owners = set()
+        self.approver_owner_id = None
         self.targets = {}
         self.inbox = None
         self.connected = False
@@ -66,11 +67,14 @@ class HaroBridge:
                 if (challenge.get("type") != "challenge" or not re.fullmatch(r"[a-f0-9]{64}", nonce)
                         or not hmac.compare_digest(challenge.get("proof", ""), proof("server"))):
                     raise RuntimeError("Haro 服务端认证失败")
-                await self._write({"type": "hello", "proof": proof("client"), "capabilities": ["approval-summary-v1", "telegram-text-v1", "meme-manager-v1"]})
+                await self._write({"type": "hello", "proof": proof("client"), "capabilities": ["approval-summary-v1", "approval-owner-v1", "telegram-text-v1", "meme-manager-v1"]})
                 packet = json.loads(await asyncio.wait_for(reader.readline(), 5))
                 if packet.get("type") != "ready":
                     raise RuntimeError("Haro 握手未完成")
                 self.owners = set(packet["owners"])
+                candidate = packet.get("approverOwnerId")
+                telegram_owners = {owner for owner in self.owners if re.fullmatch(r"telegram:[1-9]\d*", owner)}
+                self.approver_owner_id = candidate if telegram_owners == {candidate} else None
                 self.inbox = packet["inbox"]
                 self.targets = {item["id"]: item for item in packet.get("targets", [])}
                 self.generation += 1
@@ -87,6 +91,7 @@ class HaroBridge:
                     reported = True
             finally:
                 self.connected = False
+                self.approver_owner_id = None
                 self.generation += 1
                 await self._cancel_memes()
                 self.targets.clear()

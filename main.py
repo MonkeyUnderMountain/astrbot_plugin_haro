@@ -131,7 +131,7 @@ def message_context(event):
 
 
 
-@register("haro", "Haro contributors", "Haro 原生助手桥接", "0.1.4")
+@register("haro", "Haro contributors", "Haro 原生助手桥接", "0.1.5")
 class HaroPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -166,6 +166,22 @@ class HaroPlugin(Star):
     def _owner(self, source):
         return self.bridge and f"{source['platform']}:{source['sender']}" in self.bridge.owners
 
+    def _approver(self, source):
+        return (self._owner(source) and source["platform"] == "telegram"
+                and f"telegram:{source['sender']}" == getattr(self.bridge, "approver_owner_id", None))
+
+    async def _send(self, *, origin=None, chain=None, event=None, client=None, payload=None, guard=lambda: True):
+        """唯一平台提交入口。调用方提供已核验路由；提交前重查，超时不重发。"""
+        if not guard():
+            raise RuntimeError("Haro 发送来源已失效")
+        if event is not None:
+            pending = event.send(chain)
+        elif client is not None:
+            pending = client.send_message(**payload)
+        else:
+            pending = self.context.send_message(origin, chain)
+        return await asyncio.wait_for(pending, 12)
+
     @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
     async def on_private(self, event: AstrMessageEvent):
         # 按钮交给下面的专用处理器，不让普通消息监听抢先吞掉回调。
@@ -175,6 +191,8 @@ class HaroPlugin(Star):
         if not self._owner(source):
             return
         event.stop_event()
+        if event.message_obj.message_str.strip().startswith("/approve ") and not self._approver(source):
+            return
         raw = getattr(getattr(event.message_obj, "raw_message", None), "message", None)
         if source["platform"] == "telegram" and _has_topic(raw):
             # 断线时也不能借用无topic的event.send回主会话。
@@ -185,7 +203,7 @@ class HaroPlugin(Star):
                 logger.warning("Haro 私聊话题不受支持，任务未提交，无法可靠定位原话题。")
             return
         if not self.bridge.connected:
-            await event.send(event.plain_result("Haro 未连接，请检查独立 Host 是否运行。"))
+            await self._send(event=event, chain=event.plain_result("Haro 未连接，请检查独立 Host 是否运行。"))
             return
         generation = self.bridge.generation
         try:
@@ -223,12 +241,12 @@ class HaroPlugin(Star):
                                     **({"messageContext": context} if context else {})}, generation=generation)
         except Exception as error:
             logger.error(f"Haro 入站失败：{type(error).__name__}")
-            await event.send(event.plain_result("本次提交未确认，请检查 Haro 状态和插件日志，避免直接重复提交。"))
+            await self._send(event=event, chain=event.plain_result("本次提交未确认，请检查 Haro 状态和插件日志，避免直接重复提交。"))
 
     @filter.button_action("haro:approval")
     async def on_approval(self, event: AstrMessageEvent):
         source = self._source(event)
-        if not self._owner(source) or not self.bridge.connected or source["origin"] not in self._origins:
+        if not self._approver(source) or not self.bridge.connected or source["origin"] not in self._origins:
             return
         event.stop_event()
         interaction = event.get_button_interaction()
@@ -281,10 +299,14 @@ class HaroPlugin(Star):
                 if item.get("format") != "summary-v1" or not isinstance(item.get("summary"), str):
                     return {"kind": "failed", "code": "APPROVAL_HOST_UPDATE_REQUIRED"}
                 platform = self.context.get_platform_inst(origin.split(":", 1)[0])
-                if platform is None or platform.meta().name not in ("telegram", "aiocqhttp"):
+                owner = getattr(self.bridge, "approver_owner_id", None)
+                if (platform is None or platform.meta().name != "telegram" or not owner
+                        or origin != f"{origin.split(':', 1)[0]}:FriendMessage:{owner[9:]}"):
                     return {"kind": "failed", "code": "APPROVAL_CHANNEL_UNSUPPORTED"}
                 parts.extend(self._approval_parts(item))
-        return await self.context.send_message(origin, MessageChain(parts)) is True
+        generation = self.bridge.generation
+        return await self._send(origin=origin, chain=MessageChain(parts), guard=lambda:
+            self.bridge.connected and self.bridge.generation == generation and origin in self._origins) is True
 
     def _target_available(self, target):
         owner = target.get("ownerId", "")
@@ -303,11 +325,21 @@ class HaroPlugin(Star):
         target = self.bridge.targets.get(packet["targetId"])
         content = packet.get("content", [])
         if (not target or not self._target_available(target) or packet.get("origin") != target["origin"]
-                or len(content) != 1 or content[0].get("type") != "text"
-                or not isinstance(content[0].get("text"), str) or not 0 < len(content[0]["text"]) <= 1200):
+                or len(content) != 1 or content[0].get("type") not in ("text", "file", "image")):
             return {"kind": "failed", "code": "TARGET_UNAVAILABLE"}
+        item = content[0]
+        if item["type"] == "text":
+            if not isinstance(item.get("text"), str) or not 0 < len(item["text"]) <= 1200:
+                return {"kind": "failed", "code": "TARGET_UNAVAILABLE"}
+            parts = [Comp.Plain(item["text"])]
+        elif item["type"] == "file":
+            parts = [Comp.File(file=item["path"], name=item["name"])]
+        else:
+            parts = [Comp.Image.fromFileSystem(item["path"])]
+        generation = self.bridge.generation
         try:
-            sent = await self.context.send_message(target["origin"], MessageChain([Comp.Plain(content[0]["text"])]))
+            sent = await self._send(origin=target["origin"], chain=MessageChain(parts), guard=lambda:
+                self.bridge.connected and self.bridge.generation == generation and self._target_available(target))
             return {"kind": "ok"} if sent is True else {"kind": "failed", "code": "PLATFORM_REJECTED"}
         except Exception as error:
             # Telegram 明确拒绝与结果不明分开；不绕过 AstrBot 读取 Bot Token。
@@ -371,8 +403,10 @@ class HaroPlugin(Star):
             logger.warning("Haro 私聊话题不受支持，任务未提交，缺少可靠的回信话题ID。")
             return
         try:
-            await asyncio.wait_for(route["client"].send_message(chat_id=route["chatId"], **route["topicArgs"],
-                text="此话题入口暂不支持 Haro，任务未提交。请使用普通私聊。", parse_mode=None, entities=[]), 12)
+            await self._send(client=route["client"], payload={"chat_id": route["chatId"], **route["topicArgs"],
+                "text": "此话题入口暂不支持 Haro，任务未提交。请使用普通私聊。", "parse_mode": None, "entities": []},
+                guard=lambda: self.context.get_platform_inst(route["platformId"]) is route["platform"]
+                and route["platform"].get_client() is route["client"])
         except Exception as error:
             logger.warning(f"Haro 话题不支持提示未确认：{type(error).__name__}；不转投主会话。")
 
@@ -414,7 +448,10 @@ class HaroPlugin(Star):
         except (ValueError, TypeError, AttributeError, UnicodeError):
             return {"kind": "failed", "code": "TELEGRAM_TEXT_INVALID"}
         try:
-            result = await route["client"].send_message(chat_id=route["chatId"], text=text, parse_mode=None, entities=entities)
+            result = await self._send(client=route["client"], payload={"chat_id": route["chatId"], "text": text, "parse_mode": None, "entities": entities},
+                guard=lambda: self.bridge.connected and route["generation"] == self.bridge.generation
+                and route["origin"] in self._origins and self.context.get_platform_inst(route["platformId"]) is route["platform"]
+                and route["platform"].get_client() is route["client"])
             message_id = getattr(result, "message_id", None)
             if (type(message_id) is not int or message_id <= 0
                     or getattr(getattr(result, "chat", None), "id", None) != route["chatId"]):
