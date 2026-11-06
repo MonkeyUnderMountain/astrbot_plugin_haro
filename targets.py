@@ -121,6 +121,24 @@ async def _qq_send(platform, uid, item, guard):
 
 
 
+async def send_image(plugin, *, origin, platform, uid, path, guard):
+    """来源图片、主动目标和图库表情共用出口；QQ保留单次提交及真实ID。"""
+    item = {"type": "image", "path": str(path), "name": Path(path).name}
+    if not guard():
+        return {"kind": "failed", "code": "CANCELLED"}
+    try:
+        if platform.meta().name == "qq_official":
+            return await plugin._send(operation=lambda active: _qq_send(platform, uid, item, active), guard=guard)
+        sent = await plugin._send(origin=origin, chain=MessageChain([Comp.Image.fromFileSystem(str(path))]), guard=guard)
+        return {"kind": "ok"} if sent is True else {"kind": "failed", "code": "PLATFORM_REJECTED"}
+    except Exception as error:
+        rejected = False
+        if platform.meta().name == "telegram":
+            from telegram.error import BadRequest, Forbidden, InvalidToken
+            rejected = isinstance(error, (BadRequest, Forbidden, InvalidToken))
+        return {"kind": "failed" if rejected else "unknown", "code": "PLATFORM_REJECTED" if rejected else "DELIVERY_UNCONFIRMED"}
+
+
 async def deliver_target(plugin, packet):
     target = plugin.bridge.targets.get(packet["targetId"])
     content = packet.get("content", [])
@@ -140,6 +158,8 @@ async def deliver_target(plugin, packet):
         current, _ = inspect_target(plugin.context, plugin.bridge.owners, target)
         return (plugin.bridge.connected and plugin.bridge.generation == generation and current is platform
                 and packet.get("_active", lambda: True)())
+    if item["type"] == "image":
+        return await send_image(plugin, origin=target["origin"], platform=platform, uid=target["ownerId"].partition(":")[2], path=item["path"], guard=active)
     if platform.meta().name == "qq_official":
         # 不走AstrBot会重试且吞回执的send_by_session；仍从插件唯一实际提交出口调用。
         return await plugin._send(operation=lambda guard: _qq_send(platform, target["ownerId"].partition(":")[2], item, guard), guard=active)
@@ -151,8 +171,6 @@ async def deliver_target(plugin, packet):
         parts = [Comp.Plain(item["text"])]
     elif item["type"] == "file":
         parts = [Comp.File(file=item["path"], name=item["name"])]
-    else:
-        parts = [Comp.Image.fromFileSystem(item["path"])]
     try:
         sent = await plugin._send(origin=target["origin"], chain=MessageChain(parts), guard=active)
         return {"kind": "ok"} if sent is True else {"kind": "failed", "code": "PLATFORM_REJECTED"}

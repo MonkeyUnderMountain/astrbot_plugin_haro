@@ -69,7 +69,7 @@ class HaroBridge:
                 if (challenge.get("type") != "challenge" or not re.fullmatch(r"[a-f0-9]{64}", nonce)
                         or not hmac.compare_digest(challenge.get("proof", ""), proof("server"))):
                     raise RuntimeError("Haro 服务端认证失败")
-                await self._write({"type": "hello", "proof": proof("client"), "capabilities": ["approval-summary-v1", "approval-owner-v1", "telegram-text-v1", "meme-manager-v1"]})
+                await self._write({"type": "hello", "proof": proof("client"), "capabilities": ["approval-summary-v1", "approval-owner-v1", "telegram-text-v1", "meme-manager-v2"]})
                 packet = json.loads(await asyncio.wait_for(reader.readline(), 5))
                 if packet.get("type") != "ready":
                     raise RuntimeError("Haro 握手未完成")
@@ -95,18 +95,35 @@ class HaroBridge:
                 self.connected = False
                 self.approver_owner_id = None
                 self.generation += 1
-                await self._revoke_targets()
-                await self._cancel_memes()
-                self.targets.clear()
-                self.disconnected()
-                if self._writer:
-                    self._writer.close()
+                # EOF清理期间仍可能收到close；取消不能穿透到已提交的平台请求。
+                cleanup = asyncio.create_task(self._disconnect())
+                cancelled = False
+                while not cleanup.done():
                     try:
-                        await asyncio.wait_for(self._writer.wait_closed(), 1)
+                        await asyncio.shield(cleanup)
+                    except asyncio.CancelledError:
+                        cancelled = True
+                cleanup.result()
+                if cancelled:
+                    raise asyncio.CancelledError()
+            await asyncio.sleep(1)
+
+    async def _disconnect(self):
+        writer, self._writer = self._writer, None
+        try:
+            await self._revoke_targets()
+            await self._cancel_memes()
+        finally:
+            self.targets.clear()
+            try:
+                self.disconnected()
+            finally:
+                if writer:
+                    writer.close()
+                    try:
+                        await asyncio.wait_for(writer.wait_closed(), 1)
                     except Exception:
                         pass
-                    self._writer = None
-            await asyncio.sleep(1)
 
 
 
@@ -133,15 +150,15 @@ class HaroBridge:
                 continue
             if packet.get("type") == "meme_cancel":
                 key = packet.get("routeKey")
-                self.cancel_meme(key)
+                cancel_prepare = self.cancel_meme(key)
                 task = self._meme_tasks.get(key)
-                if task:
+                if task and cancel_prepare is not False:
                     task.cancel()
                 continue
             if packet.get("type") != "send":
                 continue
             # 所有平台提交都交受管任务；普通控制发送也不能挡住取消帧或EOF。
-            if packet.get("format") != "meme-manager-v1":
+            if packet.get("format") != "meme-manager-v2":
                 key = packet["id"]
                 if key in self._send_tasks or len(self._send_tasks) >= 40:
                     await self.send({"type": "receipt", "id": key, "kind": "failed", "code": "TARGET_UNAVAILABLE"})
@@ -158,7 +175,7 @@ class HaroBridge:
                         done.exception()
                 task.add_done_callback(send_finished)
                 continue
-            if packet.get("format") == "meme-manager-v1":
+            if packet.get("format") == "meme-manager-v2":
                 key = packet.get("routeKey")
                 if key in self._meme_tasks:
                     await self.send({"type": "receipt", "id": packet["id"], "kind": "failed"})
@@ -175,9 +192,9 @@ class HaroBridge:
     async def _receipt(self, packet, generation):
         try:
             local = dict(packet)
-            if "targetId" in local:
+            if "targetId" in local and packet.get("format") != "meme-manager-v2":
                 local["_active"] = lambda: self.connected and generation == self.generation and packet["id"] in self._target_active
-            result = await asyncio.wait_for(self.deliver(local), 12)
+            result = await asyncio.wait_for(self.deliver(local), 28 if packet.get("format") == "meme-manager-v2" else 12)
             if isinstance(result, bool):
                 result = {"kind": "ok" if result else "unknown"}
         except asyncio.CancelledError:
@@ -198,8 +215,9 @@ class HaroBridge:
 
     async def _cancel_memes(self):
         tasks = list(self._meme_tasks.values())
-        for task in tasks:
-            task.cancel()
+        for key, task in self._meme_tasks.items():
+            if self.cancel_meme(key) is not False:
+                task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         self._meme_tasks.clear()
 

@@ -16,8 +16,8 @@
 |---|---|
 | [main.py](main.py) | 注册事件、核验来源、提取历史引用、复制当前附件、呈现回复和固定目标发送 |
 | [bridge.py](bridge.py) | 本机 TCP JSONL、双向认证、回执和自动重连 |
-| [memes.py](memes.py) | Meme Manager 5.3.5隔离选图、固定来源、单图与清理 |
-| [targets.py](targets.py) | Telegram／QQ官方／微信本人主动目标、平台能力检查和单次QQ请求 |
+| [memes.py](memes.py) | Meme Manager 5.3.5选图、独立目的地路由、授权图片冻结、历史确认与清理 |
+| [targets.py](targets.py) | Telegram／QQ官方／微信本人目标、平台检查、共用图片出口和单次QQ请求 |
 | [metadata.yaml](metadata.yaml) | 名称、版本与更新仓库地址 |
 | [_conf_schema.json](_conf_schema.json) | 插件配置表单 |
 | README.md | 本说明 |
@@ -101,7 +101,7 @@ v0.1.5按主人最新选择只显示三行简短说明＋允许本次／拒绝�
 
 ## 使用与排查
 
-普通回复固定回可信输入来源；主人身份由 Host 的 owners 配置决定。主动发送只允许人工绑定的本人 Telegram targetId，插件再次核对具体实例、UID 和固定 origin。
+普通回复固定回可信输入来源；主人身份由 Host 的 owners 配置决定。主动发送只允许人工绑定的本人Telegram／QQ官方／个人微信targetId，插件再次核对具体实例、UID和固定origin。
 
 可以先发送 `/status` 检查连接，再用虚构内容执行 `/remember 虚构薄荷每三天浇水`、`/new`、`读取记忆`。插件加载失败看 AstrBot 日志；连接失败核对 Host ready、连接文件路径、网络和路径共享；无回复时核对平台主人 ID 与 AstrBot 当前配置是否允许 Haro 插件。
 
@@ -111,7 +111,7 @@ v0.1.5按主人最新选择只显示三行简短说明＋允许本次／拒绝�
 
 收到审批时，只看简短的操作、已知原因与目录说明，并选择允许本次或拒绝；不显示原生命令参数／补丁全文，也没有详情文件入口。只有卡片发送已确认、原来源主人同意且任务仍有效时才允许本次；5分钟、停止、断线、发送失败或unknown均不放行。提前点允许仍要等回执，此前再点拒绝可以撤销。规则已禁止的操作自动拒绝，没有允许按钮；无按钮的有效单次请求可用/approve ID accept或decline。
 
-审批不写临时文件，也不新增审批历史库；早期文件方案已移除。当前仅核对并允许Telegram与OneBot v11（aiocqhttp）的审批卡片路径，其他平台明确拒绝；实际投递和按钮仍须验收，Context返回True不等于主人已收到或阅读。
+审批不写临时文件，也不新增审批历史库；早期文件方案已移除。当前只允许Host指定的唯一Telegram主人在原来源审批，其他平台明确拒绝；实际投递和按钮仍须验收，Context返回True不等于主人已收到或阅读。
 
 Haro专属AstrBot配置档的完整模板、覆盖项、生成器及应用步骤在[开发仓库的配置指南](https://github.com/MonkeyUnderMountain/assistant-bot-haro-develop/blob/main/docs/guides/astrbot-haro-profile.md)。该档利用AstrBot路由、插件集和平台能力，关闭内置模型重复响应；它不替代平台登录、Haro外部配置或本插件的连接表单。
 
@@ -156,3 +156,15 @@ Host所有业务出站共用MessageSender，Python的离线、失败、话题、
 主动目标有按send包ID的取消门禁，读取循环不会被上传阻塞；Host停止／断线后不能继续下一步消息提交，SDK鉴权等待后也重查。已经提交HTTP的回执保留真实结果。定时Telegram任务仍只能由唯一主人在原来源审批，QQ／微信不能审批。
 
 配套Host提供schedule_create/list/update/cancel，到点进入原有单队列；Host须运行，离线错过不补跑，恢复备份后计划暂停。存储现为schema7／haro-memory-v8，旧库须离线预览、显式转换。本轮源码与本地导出不代表已更新正式实例或验证真实平台。
+
+
+
+
+
+## 2026-11-07 跨平台图库图片（v0.1.7未发布）
+
+图库路由独立于Telegram文字呈现。Telegram／QQ官方／个人微信的可信普通私聊，以及人工绑定的本人主动目标，均可用meme_categories查询目的地分类，并用message_send的meme内容立即发送一张。主动目标不继承触发来源的包或人格；目标缺图库时明确不可用。Host与插件须配套支持meme-manager-v2，旧协议不回退；连接文件、表单与schema7／v8不变。
+
+Meme Manager固定5.3.5，只负责选图和转换；Haro核验其授权图库来源、图片格式与大小，冻结后交给普通图片共用的出口。QQ上限10MiB、有效响应ID才记平台确认；Telegram／微信为渠道确认。仅成功后记录上游历史；历史或清理失败单独写日志。取消阻止后续提交，已经发送的请求保留真实结果，failed／unknown不自动重发。
+
+选图、发图不需要额外代码审批，模型只提供分类，不获得素材路径或新增文件权限。正式实例尚未更新，真实三平台显示仍待部署验收。

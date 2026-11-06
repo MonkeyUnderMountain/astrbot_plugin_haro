@@ -13,7 +13,7 @@ import astrbot.api.message_components as Comp
 
 from .bridge import HaroBridge
 from .memes import MemeIntegration
-from .targets import inspect_target, deliver_target
+from .targets import inspect_target, deliver_target, send_image
 
 
 # 历史材料只提取白名单字段；不取文件、不联网补查，也不参与主人认证或回信路由。
@@ -132,7 +132,7 @@ def message_context(event):
 
 
 
-@register("haro", "Haro contributors", "Haro 原生助手桥接", "0.1.6")
+@register("haro", "Haro contributors", "Haro 原生助手桥接", "0.1.7")
 class HaroPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -211,6 +211,7 @@ class HaroPlugin(Star):
         generation = self.bridge.generation
         try:
             presentation = self._text_presentation(event, source, generation)
+            meme_key = self.memes.capture(event, source, generation)
             attachments = []
             for component in event.get_messages():
                 if isinstance(component, Comp.Image):
@@ -241,6 +242,7 @@ class HaroPlugin(Star):
             await self.bridge.send({"type": "message", **source, "text": event.message_obj.message_str,
                                     "attachments": attachments,
                                     **({"presentation": presentation} if presentation else {}),
+                                    **({"memeRouteKey": meme_key} if meme_key else {}),
                                     **({"messageContext": context} if context else {})}, generation=generation)
         except Exception as error:
             logger.error(f"Haro 入站失败：{type(error).__name__}")
@@ -280,7 +282,7 @@ class HaroPlugin(Star):
 
     async def _deliver(self, packet):
         if "format" in packet:
-            if packet["format"] == "meme-manager-v1":
+            if packet["format"] == "meme-manager-v2":
                 return await self.memes.deliver(packet)
             if packet["format"] != "telegram-text-v1":
                 return {"kind": "failed", "code": "PRESENTATION_UNAVAILABLE"}
@@ -290,6 +292,18 @@ class HaroPlugin(Star):
         origin = packet["origin"]
         if origin not in self._origins:
             return False
+        content = packet["content"]
+        if len(content) == 1 and content[0].get("type") == "image":
+            instance, kind, uid = origin.split(":", 2)
+            platform = self.context.get_platform_inst(instance)
+            if platform is None or kind != "FriendMessage":
+                return {"kind": "failed", "code": "IMAGE_ROUTE_UNAVAILABLE"}
+            if platform.meta().name == "qq_official" and "qq_official:" + uid not in self.bridge.owners:
+                return {"kind": "failed", "code": "IMAGE_ROUTE_UNAVAILABLE"}
+            generation = self.bridge.generation
+            return await send_image(self, origin=origin, platform=platform, uid=uid, path=content[0]["path"], guard=lambda:
+                self.bridge.connected and self.bridge.generation == generation and origin in self._origins
+                and self.context.get_platform_inst(instance) is platform)
         parts = []
         for item in packet["content"]:
             if item["type"] == "text":
@@ -338,6 +352,7 @@ class HaroPlugin(Star):
     def _clear_routes(self):
         self._origins.clear()
         self._text_routes.clear()
+        self.memes.clear()
 
     def _text_presentation(self, event, source, generation):
         # 只从本次可信事件取目标；同一UMO也用不同key，不能借用后来消息的目标信息。
@@ -367,7 +382,6 @@ class HaroPlugin(Star):
         key = str(uuid.uuid4())
         self._text_routes[key] = {"origin": source["origin"], "generation": generation, "platformId": source["platformId"],
                                   "platform": platform, "client": client, "chatId": chat.id, "topic": bool(topic), "topicArgs": topic_args}
-        self.memes.capture(event, self._text_routes[key])
         # 只保留有限的来源元数据；过期key明确失败，不回退猜目标或重发。
         if len(self._text_routes) > 1024:
             del self._text_routes[next(iter(self._text_routes))]
