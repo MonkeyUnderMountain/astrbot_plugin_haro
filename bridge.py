@@ -9,12 +9,14 @@ from pathlib import Path
 
 class HaroBridge:
     def __init__(self, connection_file, deliver, log=lambda text: None,
-                 disconnected=lambda: None, inspect_targets=lambda targets: []):
+                 disconnected=lambda: None, inspect_targets=lambda targets: [], cancel_meme=lambda key: None):
         self.connection_file = Path(connection_file)
         self.deliver = deliver
         self.log = log
         self.disconnected = disconnected
         self.inspect_targets = inspect_targets
+        self.cancel_meme = cancel_meme
+        self._meme_tasks = {}
         self.owners = set()
         self.targets = {}
         self.inbox = None
@@ -64,7 +66,7 @@ class HaroBridge:
                 if (challenge.get("type") != "challenge" or not re.fullmatch(r"[a-f0-9]{64}", nonce)
                         or not hmac.compare_digest(challenge.get("proof", ""), proof("server"))):
                     raise RuntimeError("Haro 服务端认证失败")
-                await self._write({"type": "hello", "proof": proof("client"), "capabilities": ["approval-file-v1"]})
+                await self._write({"type": "hello", "proof": proof("client"), "capabilities": ["approval-summary-v1", "telegram-text-v1", "meme-manager-v1"]})
                 packet = json.loads(await asyncio.wait_for(reader.readline(), 5))
                 if packet.get("type") != "ready":
                     raise RuntimeError("Haro 握手未完成")
@@ -86,6 +88,7 @@ class HaroBridge:
             finally:
                 self.connected = False
                 self.generation += 1
+                await self._cancel_memes()
                 self.targets.clear()
                 self.disconnected()
                 if self._writer:
@@ -106,16 +109,51 @@ class HaroBridge:
     async def _read(self, reader):
         while line := await reader.readline():
             packet = json.loads(line)
+            if packet.get("type") == "meme_cancel":
+                key = packet.get("routeKey")
+                self.cancel_meme(key)
+                task = self._meme_tasks.get(key)
+                if task:
+                    task.cancel()
+                continue
             if packet.get("type") != "send":
                 continue
-            try:
-                result = await asyncio.wait_for(self.deliver(packet), 12)
-                if isinstance(result, bool):
-                    result = {"kind": "ok" if result else "unknown"}
-            except Exception as error:
-                self.log(f"Haro 渠道发送结果不明：{type(error).__name__}")
-                result = {"kind": "unknown"}
-            await self.send({"type": "receipt", "id": packet["id"], **result})
+            if packet.get("format") == "meme-manager-v1":
+                key = packet.get("routeKey")
+                if key in self._meme_tasks:
+                    await self.send({"type": "receipt", "id": packet["id"], "kind": "failed"})
+                    continue
+                task = asyncio.create_task(self._receipt(packet, self.generation))
+                self._meme_tasks[key] = task
+                def finished(done, key=key):
+                    if self._meme_tasks.get(key) is done:
+                        del self._meme_tasks[key]
+                    if not done.cancelled():
+                        done.exception()  # 断线后的回执不可重放，取出异常避免悬空任务。
+                task.add_done_callback(finished)
+            else:
+                await self._receipt(packet, self.generation)
+
+    async def _receipt(self, packet, generation):
+        try:
+            result = await asyncio.wait_for(self.deliver(packet), 12)
+            if isinstance(result, bool):
+                result = {"kind": "ok" if result else "unknown"}
+        except asyncio.CancelledError:
+            if self.connected and generation == self.generation:
+                await self.send({"type": "receipt", "id": packet["id"], "kind": "unknown", "code": "CANCELLED"}, generation=generation)
+            raise
+        except Exception as error:
+            self.log(f"Haro 渠道发送结果不明：{type(error).__name__}")
+            result = {"kind": "unknown"}
+        await self.send({"type": "receipt", "id": packet["id"], **result}, generation=generation)
+
+    async def _cancel_memes(self):
+        tasks = list(self._meme_tasks.values())
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self._meme_tasks.clear()
 
     async def close(self):
         if self._task:

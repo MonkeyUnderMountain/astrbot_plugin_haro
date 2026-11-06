@@ -1,9 +1,8 @@
 """AstrBot 处理消息呈现；身份、记忆和原生执行由独立 Haro Host 持有。"""
 import asyncio
+import re
 import shutil
-import tempfile
 import uuid
-from contextlib import ExitStack
 from datetime import datetime
 from pathlib import Path
 
@@ -13,6 +12,7 @@ from astrbot.api.star import Context, Star, register
 import astrbot.api.message_components as Comp
 
 from .bridge import HaroBridge
+from .memes import MemeIntegration
 
 
 # 历史材料只提取白名单字段；不取文件、不联网补查，也不参与主人认证或回信路由。
@@ -27,6 +27,11 @@ def _original_time(value):
     if isinstance(value, datetime) and value.tzinfo is not None and value.timestamp() > 0:
         return value.isoformat()
     return None
+
+
+def _has_topic(raw):
+    return bool(getattr(raw, "is_topic_message", False) or getattr(raw, "message_thread_id", None) is not None
+                or getattr(raw, "direct_messages_topic", None) is not None)
 
 
 def _reference_text(result, key, value, limit=4000):
@@ -133,6 +138,8 @@ class HaroPlugin(Star):
         self.config = config
         self.bridge = None
         self._origins = set()
+        self._text_routes = {}
+        self.memes = MemeIntegration(self)
 
     async def initialize(self):
         if not all(hasattr(Comp, key) for key in ("Button", "ActionRow")):
@@ -147,7 +154,8 @@ class HaroPlugin(Star):
             return
         self.bridge = HaroBridge(
             connection, self._deliver, lambda text: logger.info(f"[Haro] {text}"),
-            self._origins.clear, self._inspect_targets,
+            self._clear_routes, self._inspect_targets,
+            self.memes.cancel,
         )
         await self.bridge.start()
 
@@ -167,11 +175,21 @@ class HaroPlugin(Star):
         if not self._owner(source):
             return
         event.stop_event()
+        raw = getattr(getattr(event.message_obj, "raw_message", None), "message", None)
+        if source["platform"] == "telegram" and _has_topic(raw):
+            # 断线时也不能借用无topic的event.send回主会话。
+            presentation = self._text_presentation(event, source, self.bridge.generation)
+            if presentation:
+                await self._reject_topic(presentation["routeKey"])
+            else:
+                logger.warning("Haro 私聊话题不受支持，任务未提交，无法可靠定位原话题。")
+            return
         if not self.bridge.connected:
             await event.send(event.plain_result("Haro 未连接，请检查独立 Host 是否运行。"))
             return
         generation = self.bridge.generation
         try:
+            presentation = self._text_presentation(event, source, generation)
             attachments = []
             for component in event.get_messages():
                 if isinstance(component, Comp.Image):
@@ -201,6 +219,7 @@ class HaroPlugin(Star):
             context = message_context(event)
             await self.bridge.send({"type": "message", **source, "text": event.message_obj.message_str,
                                     "attachments": attachments,
+                                    **({"presentation": presentation} if presentation else {}),
                                     **({"messageContext": context} if context else {})}, generation=generation)
         except Exception as error:
             logger.error(f"Haro 入站失败：{type(error).__name__}")
@@ -224,12 +243,9 @@ class HaroPlugin(Star):
 
     # ========== Haro 出站与插件收尾 ==========
 
-    def _approval_parts(self, item, temporary):
-        # 文件名只含随机值。原生材料不进按钮payload或默认日志，发送后清理本机副本。
-        folder = Path(temporary.enter_context(tempfile.TemporaryDirectory(prefix=".haro-approval-", dir=self.bridge.connection_file.parent)))
-        file = folder / "approval-details.txt"
-        file.write_text(item["details"], encoding="utf-8", newline="")
-        parts = [Comp.Plain(item["summary"]), Comp.File(file=str(file), name="Haro-审批完整详情.txt")]
+    def _approval_parts(self, item):
+        # 只呈现简短说明；按钮仅含审批ID和决定，不生成详情文件或复制原生参数。
+        parts = [Comp.Plain(item["summary"])]
         if item.get("allowOnce", True):
             choices = [("accept", "允许本次"), ("decline", "拒绝")]
             parts.append(Comp.ActionRow(
@@ -242,29 +258,33 @@ class HaroPlugin(Star):
         return parts
 
     async def _deliver(self, packet):
+        if "format" in packet:
+            if packet["format"] == "meme-manager-v1":
+                return await self.memes.deliver(packet)
+            if packet["format"] != "telegram-text-v1":
+                return {"kind": "failed", "code": "PRESENTATION_UNAVAILABLE"}
+            return await self._deliver_text(packet)
         if "targetId" in packet:
             return await self._deliver_target(packet)
         origin = packet["origin"]
         if origin not in self._origins:
             return False
-        with ExitStack() as temporary:
-            parts = []
-            for item in packet["content"]:
-                if item["type"] == "text":
-                    parts.append(Comp.Plain(item["text"]))
-                elif item["type"] == "file":
-                    parts.append(Comp.File(file=item["path"], name=item["name"]))
-                elif item["type"] == "image":
-                    parts.append(Comp.Image.fromFileSystem(item["path"]))
-                elif item["type"] == "approval":
-                    if item.get("format") != "file-v1" or not all(isinstance(item.get(key), str) for key in ("summary", "details")):
-                        return {"kind": "failed", "code": "APPROVAL_HOST_UPDATE_REQUIRED"}
-                    platform = self.context.get_platform_inst(origin.split(":", 1)[0])
-                    if platform is None or platform.meta().name not in ("telegram", "aiocqhttp"):
-                        return {"kind": "failed", "code": "APPROVAL_CHANNEL_UNSUPPORTED"}
-                    parts.extend(self._approval_parts(item, temporary))
-            # 超时/取消也会退出ExitStack；不把发送任务留在后台读已删除文件。
-            return await self.context.send_message(origin, MessageChain(parts)) is True
+        parts = []
+        for item in packet["content"]:
+            if item["type"] == "text":
+                parts.append(Comp.Plain(item["text"]))
+            elif item["type"] == "file":
+                parts.append(Comp.File(file=item["path"], name=item["name"]))
+            elif item["type"] == "image":
+                parts.append(Comp.Image.fromFileSystem(item["path"]))
+            elif item["type"] == "approval":
+                if item.get("format") != "summary-v1" or not isinstance(item.get("summary"), str):
+                    return {"kind": "failed", "code": "APPROVAL_HOST_UPDATE_REQUIRED"}
+                platform = self.context.get_platform_inst(origin.split(":", 1)[0])
+                if platform is None or platform.meta().name not in ("telegram", "aiocqhttp"):
+                    return {"kind": "failed", "code": "APPROVAL_CHANNEL_UNSUPPORTED"}
+                parts.extend(self._approval_parts(item))
+        return await self.context.send_message(origin, MessageChain(parts)) is True
 
     def _target_available(self, target):
         owner = target.get("ownerId", "")
@@ -298,4 +318,114 @@ class HaroPlugin(Star):
     async def terminate(self):
         if self.bridge:
             await self.bridge.close()
+        self._clear_routes()
+
+
+
+
+
+    # ========== Telegram 本人私聊：每个来源绑定一次实际平台调用 ==========
+
+    def _clear_routes(self):
         self._origins.clear()
+        self._text_routes.clear()
+
+    def _text_presentation(self, event, source, generation):
+        # 只从本次可信事件取目标；同一UMO也用不同key，不能借用后来消息的目标信息。
+        if source["platform"] != "telegram" or not source["sender"].isdigit():
+            return None
+        raw = getattr(getattr(event.message_obj, "raw_message", None), "message", None)
+        chat = getattr(raw, "chat", None)
+        sender = getattr(raw, "from_user", None)
+        if (getattr(chat, "type", None) != "private" or str(getattr(chat, "id", None)) != source["sender"]
+                or str(getattr(sender, "id", None)) != source["sender"]):
+            return None
+        try:
+            platform = self.context.get_platform_inst(source["platformId"])
+            get_client = getattr(platform, "get_client", None)
+            if platform is None or platform.meta().name != "telegram" or not callable(get_client):
+                return None
+            client = get_client()
+        except Exception:
+            return None
+        if not callable(getattr(client, "send_message", None)):
+            return None
+        topic = _has_topic(raw)
+        thread_id = getattr(raw, "message_thread_id", None)
+        direct_id = getattr(getattr(raw, "direct_messages_topic", None), "topic_id", None)
+        topic_args = ({"message_thread_id": thread_id} if type(thread_id) is int and thread_id > 0 else
+                      {"direct_messages_topic_id": direct_id} if type(direct_id) is int and direct_id > 0 else {})
+        key = str(uuid.uuid4())
+        self._text_routes[key] = {"origin": source["origin"], "generation": generation, "platformId": source["platformId"],
+                                  "platform": platform, "client": client, "chatId": chat.id, "topic": bool(topic), "topicArgs": topic_args}
+        self.memes.capture(event, self._text_routes[key])
+        # 只保留有限的来源元数据；过期key明确失败，不回退猜目标或重发。
+        if len(self._text_routes) > 1024:
+            del self._text_routes[next(iter(self._text_routes))]
+        return {"format": "telegram-text-v1", "routeKey": key,
+                **({"unavailable": "TELEGRAM_TOPIC_UNSUPPORTED"} if topic else {})}
+
+    async def _reject_topic(self, key):
+        route = self._text_routes.pop(key)
+        if not route["topicArgs"]:
+            logger.warning("Haro 私聊话题不受支持，任务未提交，缺少可靠的回信话题ID。")
+            return
+        try:
+            await asyncio.wait_for(route["client"].send_message(chat_id=route["chatId"], **route["topicArgs"],
+                text="此话题入口暂不支持 Haro，任务未提交。请使用普通私聊。", parse_mode=None, entities=[]), 12)
+        except Exception as error:
+            logger.warning(f"Haro 话题不支持提示未确认：{type(error).__name__}；不转投主会话。")
+
+    async def _deliver_text(self, packet):
+        route = self._text_routes.get(packet.get("routeKey"))
+        if (not route or "targetId" in packet or packet.get("origin") != route["origin"]
+                or route["origin"] not in self._origins or not self.bridge.connected
+                or route["generation"] != self.bridge.generation
+                or self.context.get_platform_inst(route["platformId"]) is not route["platform"]
+                or route["platform"].get_client() is not route["client"]):
+            return {"kind": "failed", "code": "TELEGRAM_ROUTE_UNAVAILABLE"}
+        if route["topic"]:
+            return {"kind": "failed", "code": "TELEGRAM_TOPIC_UNSUPPORTED"}
+        content = packet.get("content", [])
+        try:
+            if len(content) != 1 or content[0].get("type") != "text":
+                raise ValueError()
+            item = content[0]
+            if set(item) - {"type", "text", "pre"} or not isinstance(item.get("text"), str):
+                raise ValueError()
+            text = item["text"]
+            encoded = text.encode("utf-16-le")
+            if not any(not char.isspace() and char != "\ufeff" for char in text) or "\0" in text or len(encoded) > 8192:
+                raise ValueError()
+            entities = []
+            if "pre" in item:
+                from telegram import MessageEntity
+                pre = item["pre"]
+                if (not isinstance(pre, dict) or set(pre) - {"offset", "length", "language"}
+                        or type(pre.get("offset")) is not int or type(pre.get("length")) is not int
+                        or pre["offset"] < 0 or pre["length"] <= 0 or pre["offset"] + pre["length"] > len(encoded) // 2
+                        or "language" in pre and (not isinstance(pre["language"], str)
+                                                  or not re.fullmatch(r"[\w.+#-]{1,64}", pre["language"]))):
+                    raise ValueError()
+                # 同时拒绝落在代理对中间的实体边界。
+                encoded[:pre["offset"] * 2].decode("utf-16-le")
+                encoded[pre["offset"] * 2:(pre["offset"] + pre["length"]) * 2].decode("utf-16-le")
+                entities = [MessageEntity(type=MessageEntity.PRE, **pre)]
+        except (ValueError, TypeError, AttributeError, UnicodeError):
+            return {"kind": "failed", "code": "TELEGRAM_TEXT_INVALID"}
+        try:
+            result = await route["client"].send_message(chat_id=route["chatId"], text=text, parse_mode=None, entities=entities)
+            message_id = getattr(result, "message_id", None)
+            if (type(message_id) is not int or message_id <= 0
+                    or getattr(getattr(result, "chat", None), "id", None) != route["chatId"]):
+                return {"kind": "unknown", "code": "RECEIPT_UNKNOWN"}
+            return {"kind": "ok", "messageId": str(message_id)}
+        except Exception as error:
+            from telegram.error import BadRequest, Forbidden, InvalidToken, RetryAfter, ChatMigrated
+            if isinstance(error, RetryAfter):
+                return {"kind": "failed", "code": "TELEGRAM_RATE_LIMITED"}
+            if isinstance(error, ChatMigrated):
+                return {"kind": "failed", "code": "TELEGRAM_TARGET_CHANGED"}
+            if isinstance(error, (BadRequest, Forbidden, InvalidToken)):
+                return {"kind": "failed", "code": "TELEGRAM_REJECTED"}
+            return {"kind": "unknown", "code": "RECEIPT_UNKNOWN"}
