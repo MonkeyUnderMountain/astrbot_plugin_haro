@@ -7,6 +7,10 @@ import re
 from pathlib import Path
 
 
+class _ProtocolMismatch(RuntimeError):
+    pass
+
+
 class HaroBridge:
     def __init__(self, connection_file, deliver, log=lambda text: None,
                  disconnected=lambda: None, inspect_targets=lambda targets: [], cancel_meme=lambda key: None):
@@ -69,10 +73,10 @@ class HaroBridge:
                 if (challenge.get("type") != "challenge" or not re.fullmatch(r"[a-f0-9]{64}", nonce)
                         or not hmac.compare_digest(challenge.get("proof", ""), proof("server"))):
                     raise RuntimeError("Haro 服务端认证失败")
-                await self._write({"type": "hello", "proof": proof("client"), "capabilities": ["approval-summary-v1", "approval-owner-v1", "telegram-text-v1", "meme-manager-v2"]})
+                await self._write({"type": "hello", "version": 2, "proof": proof("client")})
                 packet = json.loads(await asyncio.wait_for(reader.readline(), 5))
-                if packet.get("type") != "ready":
-                    raise RuntimeError("Haro 握手未完成")
+                if packet.get("type") != "ready" or packet.get("version") != 2:
+                    raise _ProtocolMismatch()
                 self.owners = set(packet["owners"])
                 candidate = packet.get("approverOwnerId")
                 telegram_owners = {owner for owner in self.owners if re.fullmatch(r"telegram:[1-9]\d*", owner)}
@@ -89,7 +93,8 @@ class HaroBridge:
                 raise
             except Exception as error:
                 if not reported:
-                    self.log(f"Haro 未连接，等待重连：{type(error).__name__}")
+                    reason = "协议不匹配，请配套更新Host与插件" if isinstance(error, _ProtocolMismatch) else type(error).__name__
+                    self.log(f"Haro 未连接，等待重连：{reason}")
                     reported = True
             finally:
                 self.connected = False

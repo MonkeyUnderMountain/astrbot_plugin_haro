@@ -1,42 +1,14 @@
 """人工绑定的本人目标。平台会话、凭据由AstrBot持有；发送不自动重试。"""
-import ast
 import base64
-import hashlib
-import inspect
-import json
-import textwrap
-from functools import lru_cache
 from pathlib import Path
 
 from astrbot.api.event import MessageChain
 import astrbot.api.message_components as Comp
 
 
-def _ast_shape(value):
-    # Python 3.13改变了ast.dump空字段输出；忽略空字段，保持3.12与新版解释器的契约一致。
-    if isinstance(value, ast.AST):
-        return [type(value).__name__, [[key, _ast_shape(item)] for key, item in ast.iter_fields(value) if item is not None and item != []]]
-    return [_ast_shape(item) for item in value] if isinstance(value, list) else value
-
-
-@lru_cache(maxsize=8)
-def _qq_compatible(method):
-    # qq-botpy 1.2.1的request在retry_time>2时不再请求。只认可已核过的函数，升级后先重新验证。
-    try:
-        if hasattr(method, "__wrapped__"):
-            return False
-        source = ast.parse(textwrap.dedent(inspect.getsource(method.__code__)))
-        function = next(node for node in ast.walk(source) if isinstance(node, ast.AsyncFunctionDef) and node.name == "request")
-        digest = hashlib.sha256(json.dumps(_ast_shape(function), separators=(",", ":")).encode()).hexdigest()
-        return digest == "516550b7cd6ea0d2a67903c17ef942f4c9af75791935d751419334469778e81b"
-    except (OSError, TypeError, AttributeError, StopIteration, SyntaxError):
-        return False
-
-
 def qq_http(platform):
     try:
-        http = platform.get_client().api._http
-        return http if _qq_compatible(http.request.__func__) else None
+        return platform.get_client().api._http
     except AttributeError:
         return None
 
@@ -46,17 +18,22 @@ class _TargetCancelled(Exception):
 
 
 class _QQOnce:
-    """每次鉴权等待结束后重查取消；共享AstrBot客户端，不改它的全局方法或凭据。"""
+    """复用AstrBot的已登录会话，每步只提交一次；鉴权等待后重查取消。"""
     def __init__(self, http, guard):
         self.http, self.guard = http, guard
-    def __getattr__(self, name):
-        return getattr(self.http, name)
-    async def check_session(self):
+    async def request(self, route, **kwargs):
+        from aiohttp import ClientTimeout
+        from botpy.http import _handle_response
+
         await self.http.check_session()
         if not self.guard():
             raise _TargetCancelled()
-    async def request(self, route, retry_time=2, **kwargs):
-        return await self.http.request.__func__(self, route, retry_time=retry_time, **kwargs)
+        route.is_sandbox = self.http.is_sandbox
+        # SDK request会递归重试；直接使用同一session，禁重定向，也不另建客户端。
+        async with self.http._session.request(method=route.method, url=route.url,
+                headers=self.http._headers, timeout=ClientTimeout(total=self.http.timeout),
+                allow_redirects=False, **kwargs) as response:
+            return await _handle_response(response)
 
 
 def inspect_target(context, owners, target):
@@ -95,8 +72,8 @@ async def _qq_send(platform, uid, item, guard):
             data = base64.b64encode(file.read_bytes()).decode("ascii")
             if not guard():
                 return {"kind": "failed", "code": "CANCELLED"}
-            uploaded = await http.request(Route("POST", "/v2/users/{openid}/files", openid=uid), retry_time=2,
-                allow_redirects=False, json={"file_type": 1 if item["type"] == "image" else 4,
+            uploaded = await http.request(Route("POST", "/v2/users/{openid}/files", openid=uid),
+                json={"file_type": 1 if item["type"] == "image" else 4,
                     "srv_send_msg": False, "file_data": data, "file_name": item.get("name", file.name)})
             if not isinstance(uploaded, dict) or not isinstance(uploaded.get("file_info"), str) or not uploaded["file_info"]:
                 return {"kind": "unknown", "code": "DELIVERY_UNCONFIRMED"}
@@ -104,7 +81,7 @@ async def _qq_send(platform, uid, item, guard):
         if not guard():
             return {"kind": "failed", "code": "CANCELLED"}
         response = await http.request(Route("POST", "/v2/users/{openid}/messages", openid=uid),
-            retry_time=2, allow_redirects=False, json=body)
+            json=body)
         message_id = response.get("id") if isinstance(response, dict) else None
         if (isinstance(message_id, str) and message_id.strip() and len(message_id.encode("utf-16-le")) // 2 <= 256
                 and not any(ord(char) < 32 or ord(char) == 127 for char in message_id)):

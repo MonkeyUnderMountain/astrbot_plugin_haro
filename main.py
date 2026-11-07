@@ -132,7 +132,7 @@ def message_context(event):
 
 
 
-@register("haro", "Haro contributors", "Haro 原生助手桥接", "0.1.7")
+@register("haro", "Haro contributors", "Haro 原生助手桥接", "0.1.8")
 class HaroPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -314,7 +314,7 @@ class HaroPlugin(Star):
                 parts.append(Comp.Image.fromFileSystem(item["path"]))
             elif item["type"] == "approval":
                 if item.get("format") != "summary-v1" or not isinstance(item.get("summary"), str):
-                    return {"kind": "failed", "code": "APPROVAL_HOST_UPDATE_REQUIRED"}
+                    return {"kind": "failed", "code": "INVALID_APPROVAL"}
                 platform = self.context.get_platform_inst(origin.split(":", 1)[0])
                 owner = getattr(self.bridge, "approver_owner_id", None)
                 if (platform is None or platform.meta().name != "telegram" or not owner
@@ -324,9 +324,6 @@ class HaroPlugin(Star):
         generation = self.bridge.generation
         return await self._send(origin=origin, chain=MessageChain(parts), guard=lambda:
             self.bridge.connected and self.bridge.generation == generation and origin in self._origins) is True
-
-    def _target_available(self, target):
-        return inspect_target(self.context, self.bridge.owners, target)[0] is not None
 
     def _inspect_targets(self, targets):
         result = []
