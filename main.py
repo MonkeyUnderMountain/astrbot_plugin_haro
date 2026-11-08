@@ -132,7 +132,7 @@ def message_context(event):
 
 
 
-@register("haro", "Haro contributors", "Haro 原生助手桥接", "0.1.8")
+@register("haro", "Haro contributors", "Haro 原生助手桥接", "0.1.9")
 class HaroPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)

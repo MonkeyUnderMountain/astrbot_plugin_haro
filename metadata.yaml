@@ -1,6 +1,6 @@
 name: haro
 display_name: Haro
 desc: 多渠道消息交给 Haro，共用长期记忆并使用原生 Codex 或 DSH。
-version: v0.1.8
+version: v0.1.9
 author: Haro contributors
 repo: https://github.com/MonkeyUnderMountain/astrbot_plugin_haro

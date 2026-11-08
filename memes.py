@@ -235,7 +235,7 @@ class MemeIntegration:
 
     def _manager(self):
         metadata = self.owner.context.get_registered_star("meme_manager")
-        if not metadata or str(getattr(metadata, "version", "")).lstrip("v") != "5.3.5":
+        if not metadata or str(getattr(metadata, "version", "")).lstrip("v") not in {"5.3.5", "5.3.6"}:
             raise MemeError("MEME_VERSION_UNSUPPORTED")
         manager = metadata.star_cls
         if getattr(manager, "trigger_scope", None) != "chat_and_plugin_llm" or getattr(manager, "emotion_llm_enabled", True):
